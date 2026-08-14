@@ -1,0 +1,132 @@
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const { GoogleSpreadsheet } = require('google-spreadsheet');
+const { JWT } = require('google-auth-library');
+const fs = require('fs');
+const express = require('express');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Inisialisasi Bot TANPA Polling (Karena kita pakai Webhook)
+const bot = new TelegramBot(process.env.BOT_TOKEN);
+
+app.use(express.json());
+
+// Endpoint Webhook
+app.post(`/bot${process.env.BOT_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+app.get('/', (req, res) => { res.send('Bot Webhook Active!'); });
+
+app.listen(PORT, () => { console.log(`Server Webhook aktif di port ${PORT}`); });
+
+// --- LOGIKA BOT ---
+const ADMIN_ID = parseInt(process.env.ADMIN_ID);
+const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME.startsWith('@') ? process.env.CHANNEL_USERNAME : `@${process.env.CHANNEL_USERNAME}`;
+
+const creds = JSON.parse(fs.readFileSync('./credentials.json'));
+const serviceAccountAuth = new JWT({ email: creds.client_email, key: creds.private_key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, serviceAccountAuth);
+
+let sheetsCache = null;
+async function getSheets() {
+  if (!sheetsCache) {
+    await doc.loadInfo();
+    sheetsCache = { usersSheet: doc.sheetsByTitle['Users'], taskSheet: doc.sheetsByTitle['Task_History'], wdSheet: doc.sheetsByTitle['Withdrawal_History'], settingsSheet: doc.sheetsByTitle['Settings'] };
+  }
+  return sheetsCache;
+}
+
+let cachedSettings = null;
+let lastSettingsFetch = 0;
+async function getSettings(forceRefresh = false) {
+  const now = Date.now();
+  if (!cachedSettings || forceRefresh || (now - lastSettingsFetch > 60000)) {
+    try {
+      const { settingsSheet } = await getSheets();
+      const rows = await settingsSheet.getRows();
+      if (rows.length > 0) {
+        cachedSettings = {
+          reward_per_task: parseInt(rows[0].get('reward_per_task')) || 1000,
+          min_wd: parseInt(rows[0].get('min_wd')) || 10000,
+          task_title: rows[0].get('task_title') || 'Tugas Harian',
+          task_desc: rows[0].get('task_desc') || 'Selesaikan tugas...',
+          info_text: rows[0].get('info_text') || 'Info',
+          proof_keyword: rows[0].get('proof_keyword') || '@gmail.com',
+        };
+      }
+      lastSettingsFetch = now;
+    } catch (e) { cachedSettings = { reward_per_task: 1000, min_wd: 10000, task_title: 'Tugas', task_desc: 'Tugas...', info_text: 'Info', proof_keyword: '@gmail.com' }; }
+  }
+  return cachedSettings;
+}
+
+async function checkChannelMembership(userId) {
+  try {
+    const member = await bot.getChatMember(CHANNEL_USERNAME, userId);
+    return ['creator', 'administrator', 'member'].includes(member.status);
+  } catch (error) { return true; }
+}
+
+async function calculateUserBalance(userId) {
+  try {
+    const { taskSheet, wdSheet } = await getSheets();
+    const settings = await getSettings();
+    const taskRows = await taskSheet.getRows();
+    const approvedTasks = taskRows.filter(r => r.get('user_id') == userId.toString() && r.get('status') === 'Approve').length;
+    const wdRows = await wdSheet.getRows();
+    const totalWithdrawn = wdRows.filter(r => r.get('user_id') == userId.toString() && ['Pending', 'Sukses'].includes(r.get('status'))).reduce((sum, r) => sum + (parseInt(r.get('amount')) || 0), 0);
+    return (approvedTasks * settings.reward_per_task) - totalWithdrawn;
+  } catch (e) { return 0; }
+}
+
+const userState = {};
+const getMainMenuKeyboard = (userId) => {
+  const keyboard = [
+    [{ text: '👤 Profil', callback_data: 'menu_profil' }, { text: '📋 Task', callback_data: 'menu_task' }],
+    [{ text: '📜 History & Status', callback_data: 'menu_history' }, { text: '💰 Saldo', callback_data: 'menu_saldo' }],
+    [{ text: '🏧 Riwayat Penarikan', callback_data: 'menu_wd_history' }],
+    [{ text: 'ℹ️ Info', callback_data: 'menu_info' }, { text: '❓ Help', callback_data: 'menu_help' }]
+  ];
+  if (userId === ADMIN_ID) keyboard.push([{ text: '👑 Panel Admin', callback_data: 'admin_panel' }]);
+  return { inline_keyboard: keyboard };
+};
+
+async function sendOrEdit(bot, msg, text, replyMarkup, parseMode = 'Markdown') {
+  const opts = { chat_id: msg.chat.id, message_id: msg.message_id, parse_mode: parseMode, reply_markup: replyMarkup };
+  try { await bot.editMessageText(text, opts); } catch (e) { await bot.sendMessage(msg.chat.id, text, { parse_mode: parseMode, reply_markup: replyMarkup }); }
+}
+
+bot.onText(/\/start/, async (msg) => {
+  const isMember = await checkChannelMembership(msg.from.id);
+  if (!isMember) return bot.sendMessage(msg.chat.id, 'Harap join channel dulu.');
+  await bot.sendMessage(msg.chat.id, `🎉 **Selamat datang!**`, { parse_mode: 'Markdown', reply_markup: getMainMenuKeyboard(msg.from.id) });
+});
+
+bot.on('callback_query', async (query) => {
+  const msg = query.message;
+  const userId = query.from.id;
+  const data = query.data;
+  const backBtn = { inline_keyboard: [[{ text: '🔙 Kembali', callback_data: 'menu_main' }]] };
+  
+  if (data === 'menu_main') return sendOrEdit(bot, msg, '📋 **Menu Utama:**', getMainMenuKeyboard(userId));
+  if (data === 'menu_profil') return sendOrEdit(bot, msg, `👤 **Profil**\nID: \`${userId}\``, backBtn);
+  if (data === 'menu_task') {
+      const s = await getSettings();
+      return sendOrEdit(bot, msg, `📌 **${s.task_title}**\n${s.task_desc}\nReward: ${s.reward_per_task}`, backBtn);
+  }
+  if (data === 'menu_saldo') {
+      const b = await calculateUserBalance(userId);
+      return sendOrEdit(bot, msg, `💰 **Saldo: Rp ${b}**`, { inline_keyboard: [[{text: 'Tarik', callback_data: 'wd_start'}], [{text: 'Kembali', callback_data: 'menu_main'}]] });
+  }
+  // (Tambahkan sisa logika menu lainnya di sini jika perlu, ini kerangka dasarnya)
+});
+
+bot.on('message', async (msg) => {
+    if (msg.text && msg.text.startsWith('/')) return;
+    // (Tambahkan logika pengecekan keyword bukti tugas di sini)
+});
+
