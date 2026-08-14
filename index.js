@@ -1,19 +1,34 @@
 require('dotenv').config();
+const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const fs = require('fs');
 
-// Initial Verification
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+// Express App Setup for Vercel Serverless
+const app = express();
+app.use(express.json());
+
+// Telegram Bot Initial Verification (Without Polling for Webhook/Vercel)
+const bot = new TelegramBot(process.env.BOT_TOKEN);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME.startsWith('@') ? process.env.CHANNEL_USERNAME : `@${process.env.CHANNEL_USERNAME}`;
 
-// Google Sheets Service Account Setup
-const creds = JSON.parse(fs.readFileSync('./credentials.json'));
+// Smart Auto-Detect Google Credentials (Vercel Env OR Local File)
+let creds;
+if (process.env.GOOGLE_CREDENTIALS) {
+  creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' 
+    ? JSON.parse(process.env.GOOGLE_CREDENTIALS) 
+    : process.env.GOOGLE_CREDENTIALS;
+} else if (fs.existsSync('./credentials.json')) {
+  creds = JSON.parse(fs.readFileSync('./credentials.json'));
+} else {
+  console.error("Critical Error: Credentials Google tidak ditemukan!");
+}
+
 const serviceAccountAuth = new JWT({
-  email: creds.client_email,
-  key: creds.private_key,
+  email: creds ? creds.client_email : '',
+  key: creds ? creds.private_key : '',
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
@@ -588,7 +603,6 @@ bot.on('message', async (msg) => {
   const matchedLines = lines.filter(line => line.toLowerCase().includes(keyword));
 
   if (matchedLines.length === 0) {
-    // If text does not contain keyword, ignore without response
     return;
   }
 
@@ -609,5 +623,19 @@ bot.on('message', async (msg) => {
   await bot.sendMessage(chatId, `✅ **${matchedLines.length} Bukti Tugas Terkirim!** Status: *Pending*`, { parse_mode: 'Markdown', ...getBackButton() });
 });
 
-console.log('🤖 Bot Micro-Task Sukses Berjalan!');
+// Vercel Webhook Endpoint Handling
+app.post('/', (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 
+app.get('/', (req, res) => {
+  res.send('Bot Micro-Task Serverless Running on Vercel!');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🤖 Bot Micro-Task Server Berjalan di Port ${PORT}`);
+});
+
+module.exports = app;
