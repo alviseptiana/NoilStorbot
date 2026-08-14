@@ -5,36 +5,43 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const fs = require('fs');
 
-// Express App Setup for Vercel Serverless
 const app = express();
 app.use(express.json());
 
-// Telegram Bot Initial Verification (Without Polling for Webhook/Vercel)
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME.startsWith('@') ? process.env.CHANNEL_USERNAME : `@${process.env.CHANNEL_USERNAME}`;
 
-// Smart Auto-Detect Google Credentials (Vercel Env OR Local File)
-let creds;
-if (process.env.GOOGLE_CREDENTIALS) {
-  creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' 
-    ? JSON.parse(process.env.GOOGLE_CREDENTIALS) 
-    : process.env.GOOGLE_CREDENTIALS;
-} else if (fs.existsSync('./credentials.json')) {
-  creds = JSON.parse(fs.readFileSync('./credentials.json'));
-} else {
-  console.error("Critical Error: Credentials Google tidak ditemukan!");
+// Safe Auto-Detect & Parsing Credentials for Vercel
+let clientEmail = '';
+let privateKey = '';
+
+try {
+  let creds;
+  if (process.env.GOOGLE_CREDENTIALS) {
+    creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' 
+      ? JSON.parse(process.env.GOOGLE_CREDENTIALS) 
+      : process.env.GOOGLE_CREDENTIALS;
+  } else if (fs.existsSync('./credentials.json')) {
+    creds = JSON.parse(fs.readFileSync('./credentials.json'));
+  }
+  
+  if (creds) {
+    clientEmail = creds.client_email;
+    privateKey = creds.private_key ? creds.private_key.replace(/\\n/g, '\n') : '';
+  }
+} catch (e) {
+  console.error("Error reading credentials:", e.message);
 }
 
 const serviceAccountAuth = new JWT({
-  email: creds ? creds.client_email : '',
-  key: creds ? creds.private_key : '',
+  email: clientEmail,
+  key: privateKey,
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, serviceAccountAuth);
 
-// Helper Functions
 async function getSheets() {
   await doc.loadInfo();
   return {
@@ -105,10 +112,8 @@ async function calculateUserBalance(userId) {
   return totalEarned - totalWithdrawn;
 }
 
-// User Action State (For forms like Withdrawal and Banned Admin)
 const userState = {};
 
-// UI Keyboards
 const getMainMenu = (userId) => {
   const keyboard = [
     [{ text: '👤 Profil', callback_data: 'menu_profil' }, { text: '📋 Task', callback_data: 'menu_task' }],
@@ -128,7 +133,6 @@ const getBackButton = () => ({
   }
 });
 
-// Force Sub Mechanism
 async function sendForceSubMessage(chatId) {
   const channelUrl = `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`;
   const opts = {
@@ -142,382 +146,375 @@ async function sendForceSubMessage(chatId) {
   await bot.sendMessage(chatId, 'Jika ingin menggunakan bot ini harap mengikuti channel ini terlebih dahulu.', opts);
 }
 
-// Handler: /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  if (await isUserBanned(userId)) return;
+  try {
+    if (await isUserBanned(userId)) return;
 
-  const isMember = await checkChannelMembership(userId);
-  if (!isMember) {
-    return sendForceSubMessage(chatId);
+    const isMember = await checkChannelMembership(userId);
+    if (!isMember) {
+      return sendForceSubMessage(chatId);
+    }
+
+    const { usersSheet } = await getSheets();
+    const rows = await usersSheet.getRows();
+    let user = rows.find(r => r.get('user_id') == userId.toString());
+    if (!user) {
+      await usersSheet.addRow({
+        user_id: userId.toString(),
+        username: msg.from.username || msg.from.first_name,
+        join_date: new Date().toLocaleString('id-ID'),
+        status: 'active'
+      });
+    }
+
+    await bot.sendMessage(chatId, `🎉 Selamat datang! Silahkan pilih menu di bawah ini:`, getMainMenu(userId));
+  } catch (err) {
+    console.error("Start command error:", err);
+    bot.sendMessage(chatId, "⚠️ Terjadi masalah koneksi database, coba beberapa saat lagi.").catch(() => {});
   }
-
-  // Register user if not registered
-  const { usersSheet } = await getSheets();
-  const rows = await usersSheet.getRows();
-  let user = rows.find(r => r.get('user_id') == userId.toString());
-  if (!user) {
-    await usersSheet.addRow({
-      user_id: userId.toString(),
-      username: msg.from.username || msg.from.first_name,
-      join_date: new Date().toLocaleString('id-ID'),
-      status: 'active'
-    });
-  }
-
-  await bot.sendMessage(chatId, `🎉 Selamat datang! Silahkan pilih menu di bawah ini:`, getMainMenu(userId));
 });
 
-// Callback Query Handler
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
   const data = query.data;
 
-  if (await isUserBanned(userId)) return;
+  try {
+    if (await isUserBanned(userId)) return;
 
-  await bot.answerCallbackQuery(query.id);
+    await bot.answerCallbackQuery(query.id);
 
-  // Force Sub Verification
-  if (data === 'verify_join') {
+    if (data === 'verify_join') {
+      const isMember = await checkChannelMembership(userId);
+      if (isMember) {
+        await bot.sendMessage(chatId, '✅ Terimakasih telah bergabung!', getMainMenu(userId));
+      } else {
+        await sendForceSubMessage(chatId);
+      }
+      return;
+    }
+
     const isMember = await checkChannelMembership(userId);
-    if (isMember) {
-      await bot.sendMessage(chatId, '✅ Terimakasih telah bergabung!', getMainMenu(userId));
-    } else {
-      await sendForceSubMessage(chatId);
-    }
-    return;
-  }
-
-  // Mandatory Channel Check Gate
-  const isMember = await checkChannelMembership(userId);
-  if (!isMember && !data.startsWith('admin_')) {
-    return sendForceSubMessage(chatId);
-  }
-
-  // Main Navigation
-  if (data === 'menu_main') {
-    delete userState[userId];
-    return bot.sendMessage(chatId, '📋 Menu Utama:', getMainMenu(userId));
-  }
-
-  // 1. Profil
-  if (data === 'menu_profil') {
-    const text = `👤 **Profil Pengguna**\n\n🆔 ID: \`${userId}\`\n👤 Nama: ${query.from.first_name} ${query.from.last_name || ''}\n🏷 Username: @${query.from.username || '-'}`;
-    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
-  }
-
-  // 2. Task
-  if (data === 'menu_task') {
-    const settings = await getSettings();
-    const text = `📌 **${settings.task_title}**\n\n${settings.task_desc}\n\n💵 Reward: Rp ${settings.reward_per_task}\n🔑 Inisial Bukti: \`${settings.proof_keyword}\`\n\n👇 *Kirimkan pesan bukti tugas langsung di chat ini untuk diproses.*`;
-    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
-  }
-
-  // 4. History Tugas
-  if (data === 'menu_history') {
-    const { taskSheet } = await getSheets();
-    const rows = await taskSheet.getRows();
-    const myTasks = rows.filter(r => r.get('user_id') == userId.toString());
-
-    if (myTasks.length === 0) {
-      return bot.sendMessage(chatId, '📜 Belum ada riwayat tugas yang dikirimkan.', getBackButton());
+    if (!isMember && !data.startsWith('admin_')) {
+      return sendForceSubMessage(chatId);
     }
 
-    let text = '📜 **Riwayat Tugas Kamu:**\n\n';
-    myTasks.slice(-10).forEach((t, i) => {
-      text += `${i + 1}. \`${t.get('proof_text')}\`\n   📅 Tanggal: ${t.get('date')}\n   Status: *${t.get('status')}*\n\n`;
-    });
-    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
-  }
-
-  // 5 & 6. Saldo & Tarik Saldo
-  if (data === 'menu_saldo') {
-    const balance = await calculateUserBalance(userId);
-    const settings = await getSettings();
-
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '🏧 Tarik Saldo', callback_data: 'wd_start' }],
-          [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, `💰 **Informasi Saldo**\n\nSaldo Aktif: Rp ${balance.toLocaleString('id-ID')}\nMinimum Penarikan: Rp ${settings.min_wd.toLocaleString('id-ID')}`, opts);
-  }
-
-  // Withdrawal Flow
-  if (data === 'wd_start') {
-    const balance = await calculateUserBalance(userId);
-    const settings = await getSettings();
-
-    if (balance < settings.min_wd) {
-      return bot.sendMessage(chatId, '❌ Saldo tidak mencukupi, silahkan kerjakan tugas terlebih dahulu.', getBackButton());
+    if (data === 'menu_main') {
+      delete userState[userId];
+      return bot.sendMessage(chatId, '📋 Menu Utama:', getMainMenu(userId));
     }
 
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: 'DANA', callback_data: 'wd_method_DANA' }, { text: 'OVO', callback_data: 'wd_method_OVO' }],
-          [{ text: 'GoPay', callback_data: 'wd_method_GoPay' }],
-          [{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, '💳 Pilih rekening e-wallet tujuan penarikan:', opts);
-  }
-
-  if (data.startsWith('wd_method_')) {
-    const method = data.split('_')[2];
-    userState[userId] = { step: 'AWAIT_REK_NUMBER', method };
-
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [[{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]]
-      }
-    };
-    return bot.sendMessage(chatId, `Silahkan kirim nomor rekening ${method} kamu (berawalan 08...):`, opts);
-  }
-
-  if (data === 'wd_confirm') {
-    const state = userState[userId];
-    if (!state || !state.account_number) return bot.sendMessage(chatId, 'Sesi kadaluarsa.', getBackButton());
-
-    const balance = await calculateUserBalance(userId);
-    const { wdSheet } = await getSheets();
-
-    await wdSheet.addRow({
-      wd_id: 'WD-' + Date.now(),
-      user_id: userId.toString(),
-      method: state.method,
-      account_number: state.account_number,
-      amount: balance,
-      date: new Date().toLocaleString('id-ID'),
-      status: 'Pending'
-    });
-
-    delete userState[userId];
-    return bot.sendMessage(chatId, '⏳ Penarikan sedang diproses oleh admin.', getBackButton());
-  }
-
-  // 7. Riwayat Penarikan User
-  if (data === 'menu_wd_history') {
-    const { wdSheet } = await getSheets();
-    const rows = await wdSheet.getRows();
-    const myWds = rows.filter(r => r.get('user_id') == userId.toString());
-
-    if (myWds.length === 0) {
-      return bot.sendMessage(chatId, '🏧 Belum ada riwayat penarikan.', getBackButton());
+    if (data === 'menu_profil') {
+      const text = `👤 **Profil Pengguna**\n\n🆔 ID: \`${userId}\`\n👤 Nama: ${query.from.first_name} ${query.from.last_name || ''}\n🏷 Username: @${query.from.username || '-'}`;
+      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
     }
 
-    let text = '🏧 **Riwayat Penarikan Saldo:**\n\n';
-    myWds.forEach((w, i) => {
-      text += `${i + 1}. Rp ${parseInt(w.get('amount')).toLocaleString('id-ID')} (${w.get('method')} - ${w.get('account_number')})\n   📅 ${w.get('date')}\n   Status: *${w.get('status')}*\n\n`;
-    });
-    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
-  }
-
-  // 8. Help & 9. Info
-  if (data === 'menu_help') {
-    return bot.sendMessage(chatId, `❓ Butuh bantuan? Silahkan hubungi Admin: [Klik Disini](tg://user?id=${ADMIN_ID})`, { parse_mode: 'Markdown', ...getBackButton() });
-  }
-
-  if (data === 'menu_info') {
-    const settings = await getSettings();
-    const channelUrl = `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`;
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '📢 Kunjungi Channel', url: channelUrl }],
-          [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, `ℹ️ **Informasi Bot**\n\n${settings.info_text}`, opts);
-  }
-
-  // ================= ADMIN PANEL LOGIC =================
-  if (userId !== ADMIN_ID) return;
-
-  if (data === 'admin_panel') {
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '💵 Set Reward', callback_data: 'admin_set_reward' }, { text: '📝 Set Task', callback_data: 'admin_set_task' }],
-          [{ text: 'ℹ️ Edit Info', callback_data: 'admin_edit_info' }, { text: '🚫 Banned User', callback_data: 'admin_ban_user' }],
-          [{ text: '📜 User Task History', callback_data: 'admin_user_history' }],
-          [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, '👑 **Panel Admin**', opts);
-  }
-
-  if (data === 'admin_ban_user') {
-    userState[userId] = { step: 'AWAIT_BAN_ID' };
-    return bot.sendMessage(chatId, 'Kirimkan Telegram ID user yang ingin di-banned:', getBackButton());
-  }
-
-  if (data.startsWith('admin_confirm_ban_')) {
-    const targetId = data.split('_')[3];
-    const { usersSheet } = await getSheets();
-    const rows = await usersSheet.getRows();
-    const userRow = rows.find(r => r.get('user_id') == targetId);
-    if (userRow) {
-      userRow.set('status', 'banned');
-      await userRow.save();
-      return bot.sendMessage(chatId, `✅ User \`${targetId}\` berhasil di-banned!`, { parse_mode: 'Markdown', ...getBackButton() });
+    if (data === 'menu_task') {
+      const settings = await getSettings();
+      const text = `📌 **${settings.task_title}**\n\n${settings.task_desc}\n\n💵 Reward: Rp ${settings.reward_per_task}\n🔑 Inisial Bukti: \`${settings.proof_keyword}\`\n\n👇 *Kirimkan pesan bukti tugas langsung di chat ini untuk diproses.*`;
+      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
     }
-  }
 
-  if (data === 'admin_user_history') {
-    userState[userId] = { step: 'AWAIT_ADMIN_SEARCH_ID' };
-    return bot.sendMessage(chatId, '🔍 Kirimkan Telegram ID user yang ingin dicari riwayatnya:', getBackButton());
-  }
+    if (data === 'menu_history') {
+      const { taskSheet } = await getSheets();
+      const rows = await taskSheet.getRows();
+      const myTasks = rows.filter(r => r.get('user_id') == userId.toString());
 
-  if (data.startsWith('admin_view_tasks_')) {
-    const targetId = data.split('_')[3];
-    const { taskSheet } = await getSheets();
-    const rows = await taskSheet.getRows();
-    const userTasks = rows.filter(r => r.get('user_id') == targetId);
-
-    // Group dates
-    const dates = [...new Set(userTasks.map(r => r.get('date').split(',')[0]))];
-    const buttons = dates.map(d => [{ text: `📅 ${d}`, callback_data: `admin_tasks_date_${targetId}_${d}` }]);
-    buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
-
-    return bot.sendMessage(chatId, `📅 Pilih tanggal tugas untuk ID: \`${targetId}\``, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-  }
-
-  if (data.startsWith('admin_tasks_date_')) {
-    const [, , , targetId, dateStr, pageStr] = data.split('_');
-    const page = parseInt(pageStr) || 1;
-    const { taskSheet } = await getSheets();
-    const rows = await taskSheet.getRows();
-    const dayTasks = rows.filter(r => r.get('user_id') == targetId && r.get('date').startsWith(dateStr));
-
-    const limit = 30;
-    const totalPages = Math.ceil(dayTasks.length / limit) || 1;
-    const startIndex = (page - 1) * limit;
-    const pageTasks = dayTasks.slice(startIndex, startIndex + limit);
-
-    const buttons = pageTasks.map(t => {
-      const isApproved = t.get('status') === 'Approve';
-      const isRejected = t.get('status') === 'Rejected';
-      const statusSymbol = isApproved ? '✅' : isRejected ? '❌' : '⏳';
-      return [{ text: `${statusSymbol} ${t.get('proof_text').substring(0, 20)}...`, callback_data: `admin_item_task_${t.get('task_id')}` }];
-    });
-
-    const navButtons = [];
-    if (page > 1) navButtons.push({ text: '◀️ Prev', callback_data: `admin_tasks_date_${targetId}_${dateStr}_${page - 1}` });
-    if (page < totalPages) navButtons.push({ text: 'Next ▶️', callback_data: `admin_tasks_date_${targetId}_${dateStr}_${page + 1}` });
-    if (navButtons.length) buttons.push(navButtons);
-
-    buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
-
-    return bot.sendMessage(chatId, `📜 Daftar Tugas ID \`${targetId}\` Tanggal \`${dateStr}\` (Hal ${page}/${totalPages}):`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-  }
-
-  if (data.startsWith('admin_item_task_')) {
-    const taskId = data.replace('admin_item_task_', '');
-    const { taskSheet } = await getSheets();
-    const rows = await taskSheet.getRows();
-    const task = rows.find(r => r.get('task_id') === taskId);
-
-    if (!task) return bot.sendMessage(chatId, 'Tugas tidak ditemukan.');
-
-    const text = `📌 **Detail Tugas**\n\nID Task: \`${task.get('task_id')}\`\nUser ID: \`${task.get('user_id')}\`\nBukti: \`${task.get('proof_text')}\`\nStatus: *${task.get('status')}*`;
-    const opts = {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '✅ Approve', callback_data: `admin_act_task_Approve_${taskId}` }, { text: '❌ Reject', callback_data: `admin_act_task_Rejected_${taskId}` }],
-          [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, text, opts);
-  }
-
-  if (data.startsWith('admin_act_task_')) {
-    const [, , , newStatus, taskId] = data.split('_');
-    const { taskSheet } = await getSheets();
-    const rows = await taskSheet.getRows();
-    const task = rows.find(r => r.get('task_id') === taskId);
-
-    if (task) {
-      task.set('status', newStatus);
-      await task.save();
-
-      const targetUserId = task.get('user_id');
-
-      if (newStatus === 'Approve') {
-        await bot.sendMessage(targetUserId, '🎉 1 tugas berhasil disetujui, saldo ditambahkan!').catch(() => {});
-      } else {
-        await bot.sendMessage(targetUserId, `❌ Salah satu tugas kamu (${task.get('proof_text')}) ditolak oleh Admin.`).catch(() => {});
+      if (myTasks.length === 0) {
+        return bot.sendMessage(chatId, '📜 Belum ada riwayat tugas yang dikirimkan.', getBackButton());
       }
 
-      return bot.sendMessage(chatId, `✅ Status tugas berhasil diubah menjadi: *${newStatus}*`, { parse_mode: 'Markdown', ...getBackButton() });
+      let text = '📜 **Riwayat Tugas Kamu:**\n\n';
+      myTasks.slice(-10).forEach((t, i) => {
+        text += `${i + 1}. \`${t.get('proof_text')}\`\n   📅 Tanggal: ${t.get('date')}\n   Status: *${t.get('status')}*\n\n`;
+      });
+      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
     }
-  }
 
-  if (data.startsWith('admin_view_wds_')) {
-    const targetId = data.split('_')[3];
-    const { wdSheet } = await getSheets();
-    const rows = await wdSheet.getRows();
-    const userWds = rows.filter(r => r.get('user_id') == targetId);
+    if (data === 'menu_saldo') {
+      const balance = await calculateUserBalance(userId);
+      const settings = await getSettings();
 
-    const buttons = userWds.map(w => [{ text: `${w.get('status') === 'Sukses' ? '✅' : '⏳'} Rp ${w.get('amount')} (${w.get('method')})`, callback_data: `admin_item_wd_${w.get('wd_id')}` }]);
-    buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
-
-    return bot.sendMessage(chatId, `🏧 Daftar Penarikan ID \`${targetId}\`:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-  }
-
-  if (data.startsWith('admin_item_wd_')) {
-    const wdId = data.replace('admin_item_wd_', '');
-    const { wdSheet } = await getSheets();
-    const rows = await wdSheet.getRows();
-    const wd = rows.find(r => r.get('wd_id') === wdId);
-
-    const opts = {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '✅ Set Sukses', callback_data: `admin_act_wd_Sukses_${wdId}` }, { text: '❌ Reject', callback_data: `admin_act_wd_Rejected_${wdId}` }],
-          [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
-        ]
-      }
-    };
-    return bot.sendMessage(chatId, `🏧 **Detail Penarikan**\n\nNominal: Rp ${wd.get('amount')}\nMetode: ${wd.get('method')}\nNo Rek: \`${wd.get('account_number')}\`\nStatus: *${wd.get('status')}*`, opts);
-  }
-
-  if (data.startsWith('admin_act_wd_')) {
-    const [, , , newStatus, wdId] = data.split('_');
-    const { wdSheet } = await getSheets();
-    const rows = await wdSheet.getRows();
-    const wd = rows.find(r => r.get('wd_id') === wdId);
-
-    if (wd) {
-      wd.set('status', newStatus);
-      await wd.save();
-
-      const targetUserId = wd.get('user_id');
-
-      if (newStatus === 'Sukses') {
-        await bot.sendMessage(targetUserId, '✅ Penarikan berhasil diproses!').catch(() => {});
-      } else {
-        await bot.sendMessage(targetUserId, `❌ Penarikan saldo kamu sebesar Rp ${wd.get('amount')} ditolak. Saldo dikembalikan.`).catch(() => {});
-      }
-
-      return bot.sendMessage(chatId, `✅ Status penarikan diubah menjadi: *${newStatus}*`, { parse_mode: 'Markdown', ...getBackButton() });
+      const opts = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🏧 Tarik Saldo', callback_data: 'wd_start' }],
+            [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, `💰 **Informasi Saldo**\n\nSaldo Aktif: Rp ${balance.toLocaleString('id-ID')}\nMinimum Penarikan: Rp ${settings.min_wd.toLocaleString('id-ID')}`, opts);
     }
+
+    if (data === 'wd_start') {
+      const balance = await calculateUserBalance(userId);
+      const settings = await getSettings();
+
+      if (balance < settings.min_wd) {
+        return bot.sendMessage(chatId, '❌ Saldo tidak mencukupi, silahkan kerjakan tugas terlebih dahulu.', getBackButton());
+      }
+
+      const opts = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: 'DANA', callback_data: 'wd_method_DANA' }, { text: 'OVO', callback_data: 'wd_method_OVO' }],
+            [{ text: 'GoPay', callback_data: 'wd_method_GoPay' }],
+            [{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, '💳 Pilih rekening e-wallet tujuan penarikan:', opts);
+    }
+
+    if (data.startsWith('wd_method_')) {
+      const method = data.split('_')[2];
+      userState[userId] = { step: 'AWAIT_REK_NUMBER', method };
+
+      const opts = {
+        reply_markup: {
+          inline_keyboard: [[{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]]
+        }
+      };
+      return bot.sendMessage(chatId, `Silahkan kirim nomor rekening ${method} kamu (berawalan 08...):`, opts);
+    }
+
+    if (data === 'wd_confirm') {
+      const state = userState[userId];
+      if (!state || !state.account_number) return bot.sendMessage(chatId, 'Sesi kadaluarsa.', getBackButton());
+
+      const balance = await calculateUserBalance(userId);
+      const { wdSheet } = await getSheets();
+
+      await wdSheet.addRow({
+        wd_id: 'WD-' + Date.now(),
+        user_id: userId.toString(),
+        method: state.method,
+        account_number: state.account_number,
+        amount: balance,
+        date: new Date().toLocaleString('id-ID'),
+        status: 'Pending'
+      });
+
+      delete userState[userId];
+      return bot.sendMessage(chatId, '⏳ Penarikan sedang diproses oleh admin.', getBackButton());
+    }
+
+    if (data === 'menu_wd_history') {
+      const { wdSheet } = await getSheets();
+      const rows = await wdSheet.getRows();
+      const myWds = rows.filter(r => r.get('user_id') == userId.toString());
+
+      if (myWds.length === 0) {
+        return bot.sendMessage(chatId, '🏧 Belum ada riwayat penarikan.', getBackButton());
+      }
+
+      let text = '🏧 **Riwayat Penarikan Saldo:**\n\n';
+      myWds.forEach((w, i) => {
+        text += `${i + 1}. Rp ${parseInt(w.get('amount')).toLocaleString('id-ID')} (${w.get('method')} - ${w.get('account_number')})\n   📅 ${w.get('date')}\n   Status: *${w.get('status')}*\n\n`;
+      });
+      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
+    }
+
+    if (data === 'menu_help') {
+      return bot.sendMessage(chatId, `❓ Butuh bantuan? Silahkan hubungi Admin: [Klik Disini](tg://user?id=${ADMIN_ID})`, { parse_mode: 'Markdown', ...getBackButton() });
+    }
+
+    if (data === 'menu_info') {
+      const settings = await getSettings();
+      const channelUrl = `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`;
+      const opts = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📢 Kunjungi Channel', url: channelUrl }],
+            [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, `ℹ️ **Informasi Bot**\n\n${settings.info_text}`, opts);
+    }
+
+    if (userId !== ADMIN_ID) return;
+
+    if (data === 'admin_panel') {
+      const opts = {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '💵 Set Reward', callback_data: 'admin_set_reward' }, { text: '📝 Set Task', callback_data: 'admin_set_task' }],
+            [{ text: 'ℹ️ Edit Info', callback_data: 'admin_edit_info' }, { text: '🚫 Banned User', callback_data: 'admin_ban_user' }],
+            [{ text: '📜 User Task History', callback_data: 'admin_user_history' }],
+            [{ text: '🔙 Kembali ke Menu Utama', callback_data: 'menu_main' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, '👑 **Panel Admin**', opts);
+    }
+
+    if (data === 'admin_ban_user') {
+      userState[userId] = { step: 'AWAIT_BAN_ID' };
+      return bot.sendMessage(chatId, 'Kirimkan Telegram ID user yang ingin di-banned:', getBackButton());
+    }
+
+    if (data.startsWith('admin_confirm_ban_')) {
+      const targetId = data.split('_')[3];
+      const { usersSheet } = await getSheets();
+      const rows = await usersSheet.getRows();
+      const userRow = rows.find(r => r.get('user_id') == targetId);
+      if (userRow) {
+        userRow.set('status', 'banned');
+        await userRow.save();
+        return bot.sendMessage(chatId, `✅ User \`${targetId}\` berhasil di-banned!`, { parse_mode: 'Markdown', ...getBackButton() });
+      }
+    }
+
+    if (data === 'admin_user_history') {
+      userState[userId] = { step: 'AWAIT_ADMIN_SEARCH_ID' };
+      return bot.sendMessage(chatId, '🔍 Kirimkan Telegram ID user yang ingin dicari riwayatnya:', getBackButton());
+    }
+
+    if (data.startsWith('admin_view_tasks_')) {
+      const targetId = data.split('_')[3];
+      const { taskSheet } = await getSheets();
+      const rows = await taskSheet.getRows();
+      const userTasks = rows.filter(r => r.get('user_id') == targetId);
+
+      const dates = [...new Set(userTasks.map(r => r.get('date').split(',')[0]))];
+      const buttons = dates.map(d => [{ text: `📅 ${d}`, callback_data: `admin_tasks_date_${targetId}_${d}` }]);
+      buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
+
+      return bot.sendMessage(chatId, `📅 Pilih tanggal tugas untuk ID: \`${targetId}\``, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+    }
+
+    if (data.startsWith('admin_tasks_date_')) {
+      const [, , , targetId, dateStr, pageStr] = data.split('_');
+      const page = parseInt(pageStr) || 1;
+      const { taskSheet } = await getSheets();
+      const rows = await taskSheet.getRows();
+      const dayTasks = rows.filter(r => r.get('user_id') == targetId && r.get('date').startsWith(dateStr));
+
+      const limit = 30;
+      const totalPages = Math.ceil(dayTasks.length / limit) || 1;
+      const startIndex = (page - 1) * limit;
+      const pageTasks = dayTasks.slice(startIndex, startIndex + limit);
+
+      const buttons = pageTasks.map(t => {
+        const isApproved = t.get('status') === 'Approve';
+        const isRejected = t.get('status') === 'Rejected';
+        const statusSymbol = isApproved ? '✅' : isRejected ? '❌' : '⏳';
+        return [{ text: `${statusSymbol} ${t.get('proof_text').substring(0, 20)}...`, callback_data: `admin_item_task_${t.get('task_id')}` }];
+      });
+
+      const navButtons = [];
+      if (page > 1) navButtons.push({ text: '◀️ Prev', callback_data: `admin_tasks_date_${targetId}_${dateStr}_${page - 1}` });
+      if (page < totalPages) navButtons.push({ text: 'Next ▶️', callback_data: `admin_tasks_date_${targetId}_${dateStr}_${page + 1}` });
+      if (navButtons.length) buttons.push(navButtons);
+
+      buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
+
+      return bot.sendMessage(chatId, `📜 Daftar Tugas ID \`${targetId}\` Tanggal \`${dateStr}\` (Hal ${page}/${totalPages}):`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+    }
+
+    if (data.startsWith('admin_item_task_')) {
+      const taskId = data.replace('admin_item_task_', '');
+      const { taskSheet } = await getSheets();
+      const rows = await taskSheet.getRows();
+      const task = rows.find(r => r.get('task_id') === taskId);
+
+      if (!task) return bot.sendMessage(chatId, 'Tugas tidak ditemukan.');
+
+      const text = `📌 **Detail Tugas**\n\nID Task: \`${task.get('task_id')}\`\nUser ID: \`${task.get('user_id')}\`\nBukti: \`${task.get('proof_text')}\`\nStatus: *${task.get('status')}*`;
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Approve', callback_data: `admin_act_task_Approve_${taskId}` }, { text: '❌ Reject', callback_data: `admin_act_task_Rejected_${taskId}` }],
+            [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, text, opts);
+    }
+
+    if (data.startsWith('admin_act_task_')) {
+      const [, , , newStatus, taskId] = data.split('_');
+      const { taskSheet } = await getSheets();
+      const rows = await taskSheet.getRows();
+      const task = rows.find(r => r.get('task_id') === taskId);
+
+      if (task) {
+        task.set('status', newStatus);
+        await task.save();
+
+        const targetUserId = task.get('user_id');
+
+        if (newStatus === 'Approve') {
+          await bot.sendMessage(targetUserId, '🎉 1 tugas berhasil disetujui, saldo ditambahkan!').catch(() => {});
+        } else {
+          await bot.sendMessage(targetUserId, `❌ Salah satu tugas kamu (${task.get('proof_text')}) ditolak oleh Admin.`).catch(() => {});
+        }
+
+        return bot.sendMessage(chatId, `✅ Status tugas berhasil diubah menjadi: *${newStatus}*`, { parse_mode: 'Markdown', ...getBackButton() });
+      }
+    }
+
+    if (data.startsWith('admin_view_wds_')) {
+      const targetId = data.split('_')[3];
+      const { wdSheet } = await getSheets();
+      const rows = await wdSheet.getRows();
+      const userWds = rows.filter(r => r.get('user_id') == targetId);
+
+      const buttons = userWds.map(w => [{ text: `${w.get('status') === 'Sukses' ? '✅' : '⏳'} Rp ${w.get('amount')} (${w.get('method')})`, callback_data: `admin_item_wd_${w.get('wd_id')}` }]);
+      buttons.push([{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]);
+
+      return bot.sendMessage(chatId, `🏧 Daftar Penarikan ID \`${targetId}\`:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+    }
+
+    if (data.startsWith('admin_item_wd_')) {
+      const wdId = data.replace('admin_item_wd_', '');
+      const { wdSheet } = await getSheets();
+      const rows = await wdSheet.getRows();
+      const wd = rows.find(r => r.get('wd_id') === wdId);
+
+      const opts = {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Set Sukses', callback_data: `admin_act_wd_Sukses_${wdId}` }, { text: '❌ Reject', callback_data: `admin_act_wd_Rejected_${wdId}` }],
+            [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
+          ]
+        }
+      };
+      return bot.sendMessage(chatId, `🏧 **Detail Penarikan**\n\nNominal: Rp ${wd.get('amount')}\nMetode: ${wd.get('method')}\nNo Rek: \`${wd.get('account_number')}\`\nStatus: *${wd.get('status')}*`, opts);
+    }
+
+    if (data.startsWith('admin_act_wd_')) {
+      const [, , , newStatus, wdId] = data.split('_');
+      const { wdSheet } = await getSheets();
+      const rows = await wdSheet.getRows();
+      const wd = rows.find(r => r.get('wd_id') === wdId);
+
+      if (wd) {
+        wd.set('status', newStatus);
+        await wd.save();
+
+        const targetUserId = wd.get('user_id');
+
+        if (newStatus === 'Sukses') {
+          await bot.sendMessage(targetUserId, '✅ Penarikan berhasil diproses!').catch(() => {});
+        } else {
+          await bot.sendMessage(targetUserId, `❌ Penarikan saldo kamu sebesar Rp ${wd.get('amount')} ditolak. Saldo dikembalikan.`).catch(() => {});
+        }
+
+        return bot.sendMessage(chatId, `✅ Status penarikan diubah menjadi: *${newStatus}*`, { parse_mode: 'Markdown', ...getBackButton() });
+      }
+    }
+  } catch (err) {
+    console.error("Callback error:", err);
   }
 });
 
-// Text Message Listener (Proof Parsing & Admin Inputs)
 bot.on('message', async (msg) => {
   if (msg.text && msg.text.startsWith('/')) return;
 
@@ -525,117 +522,116 @@ bot.on('message', async (msg) => {
   const userId = msg.from.id;
   const text = msg.text || '';
 
-  if (await isUserBanned(userId)) return;
+  try {
+    if (await isUserBanned(userId)) return;
 
-  // Withdrawal Account Number Input State
-  if (userState[userId] && userState[userId].step === 'AWAIT_REK_NUMBER') {
-    if (!text.startsWith('08')) {
-      return bot.sendMessage(chatId, '❌ Nomor rekening harus berawalan "08". Silahkan coba lagi:');
-    }
-
-    userState[userId].account_number = text;
-    userState[userId].step = 'CONFIRM_WD';
-
-    const opts = {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '✅ Konfirmasi Penarikan', callback_data: 'wd_confirm' }],
-          [{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]
-        ]
+    if (userState[userId] && userState[userId].step === 'AWAIT_REK_NUMBER') {
+      if (!text.startsWith('08')) {
+        return bot.sendMessage(chatId, '❌ Nomor rekening harus berawalan "08". Silahkan coba lagi:');
       }
-    };
-    return bot.sendMessage(chatId, `📌 **Konfirmasi Penarikan**\n\nMetode: ${userState[userId].method}\nNo Rekening: ${text}`, opts);
-  }
 
-  // Admin Prompt Inputs
-  if (userId === ADMIN_ID && userState[userId]) {
-    const step = userState[userId].step;
-
-    if (step === 'AWAIT_BAN_ID') {
-      const { usersSheet } = await getSheets();
-      const rows = await usersSheet.getRows();
-      const userRow = rows.find(r => r.get('user_id') == text.trim());
-
-      delete userState[userId];
-
-      if (!userRow) {
-        return bot.sendMessage(chatId, '❌ ID tidak ditemukan!', getBackButton());
-      }
+      userState[userId].account_number = text;
+      userState[userId].step = 'CONFIRM_WD';
 
       const opts = {
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🚫 Banned User Ini', callback_data: `admin_confirm_ban_${text.trim()}` }],
-            [{ text: '🔙 Kembali', callback_data: 'admin_panel' }]
+            [{ text: '✅ Konfirmasi Penarikan', callback_data: 'wd_confirm' }],
+            [{ text: '❌ Batalkan Penarikan', callback_data: 'menu_main' }]
           ]
         }
       };
-      return bot.sendMessage(chatId, `ID ditemukan: \`${text.trim()}\`. Konfirmasi Banned?`, { parse_mode: 'Markdown', ...opts });
+      return bot.sendMessage(chatId, `📌 **Konfirmasi Penarikan**\n\nMetode: ${userState[userId].method}\nNo Rekening: ${text}`, opts);
     }
 
-    if (step === 'AWAIT_ADMIN_SEARCH_ID') {
-      const targetId = text.trim();
-      delete userState[userId];
+    if (userId === ADMIN_ID && userState[userId]) {
+      const step = userState[userId].step;
 
-      const opts = {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📜 History Tugas', callback_data: `admin_view_tasks_${targetId}` }],
-            [{ text: '🏧 History Penarikan', callback_data: `admin_view_wds_${targetId}` }],
-            [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
-          ]
+      if (step === 'AWAIT_BAN_ID') {
+        const { usersSheet } = await getSheets();
+        const rows = await usersSheet.getRows();
+        const userRow = rows.find(r => r.get('user_id') == text.trim());
+
+        delete userState[userId];
+
+        if (!userRow) {
+          return bot.sendMessage(chatId, '❌ ID tidak ditemukan!', getBackButton());
         }
-      };
-      return bot.sendMessage(chatId, `User ID ditemukan: \`${targetId}\`. Pilih data yang ingin dilihat:`, opts);
+
+        const opts = {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🚫 Banned User Ini', callback_data: `admin_confirm_ban_${text.trim()}` }],
+              [{ text: '🔙 Kembali', callback_data: 'admin_panel' }]
+            ]
+          }
+        };
+        return bot.sendMessage(chatId, `ID ditemukan: \`${text.trim()}\`. Konfirmasi Banned?`, { parse_mode: 'Markdown', ...opts });
+      }
+
+      if (step === 'AWAIT_ADMIN_SEARCH_ID') {
+        const targetId = text.trim();
+        delete userState[userId];
+
+        const opts = {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📜 History Tugas', callback_data: `admin_view_tasks_${targetId}` }],
+              [{ text: '🏧 History Penarikan', callback_data: `admin_view_wds_${targetId}` }],
+              [{ text: '🔙 Panel Admin', callback_data: 'admin_panel' }]
+            ]
+          }
+        };
+        return bot.sendMessage(chatId, `User ID ditemukan: \`${targetId}\`. Pilih data yang ingin dilihat:`, opts);
+      }
     }
+
+    const isMember = await checkChannelMembership(userId);
+    if (!isMember) return sendForceSubMessage(chatId);
+
+    const settings = await getSettings();
+    const keyword = settings.proof_keyword.toLowerCase();
+    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+    const matchedLines = lines.filter(line => line.toLowerCase().includes(keyword));
+
+    if (matchedLines.length === 0) {
+      return;
+    }
+
+    const { taskSheet } = await getSheets();
+    const currentDate = new Date().toLocaleString('id-ID');
+
+    for (const proof of matchedLines) {
+      await taskSheet.addRow({
+        task_id: 'TSK-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+        user_id: userId.toString(),
+        username: msg.from.username || msg.from.first_name,
+        proof_text: proof,
+        date: currentDate,
+        status: 'Pending'
+      });
+    }
+
+    await bot.sendMessage(chatId, `✅ **${matchedLines.length} Bukti Tugas Terkirim!** Status: *Pending*`, { parse_mode: 'Markdown', ...getBackButton() });
+  } catch (err) {
+    console.error("Message handler error:", err);
   }
-
-  // Mandatory Channel Check Gate for Tasks
-  const isMember = await checkChannelMembership(userId);
-  if (!isMember) return sendForceSubMessage(chatId);
-
-  // Task Submission Engine (Parsing Multi-line by Proof Keyword)
-  const settings = await getSettings();
-  const keyword = settings.proof_keyword.toLowerCase();
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
-  const matchedLines = lines.filter(line => line.toLowerCase().includes(keyword));
-
-  if (matchedLines.length === 0) {
-    return;
-  }
-
-  const { taskSheet } = await getSheets();
-  const currentDate = new Date().toLocaleString('id-ID');
-
-  for (const proof of matchedLines) {
-    await taskSheet.addRow({
-      task_id: 'TSK-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
-      user_id: userId.toString(),
-      username: msg.from.username || msg.from.first_name,
-      proof_text: proof,
-      date: currentDate,
-      status: 'Pending'
-    });
-  }
-
-  await bot.sendMessage(chatId, `✅ **${matchedLines.length} Bukti Tugas Terkirim!** Status: *Pending*`, { parse_mode: 'Markdown', ...getBackButton() });
 });
 
-// Vercel Webhook Endpoint Handling
 app.post('/', (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
 app.get('/', (req, res) => {
-  res.send('Bot Micro-Task Serverless Running on Vercel!');
+  res.send('Bot Server Ready!');
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🤖 Bot Micro-Task Server Berjalan di Port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
 
 module.exports = app;
