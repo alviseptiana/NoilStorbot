@@ -8,6 +8,7 @@ const app = express();
 app.use(express.json());
 
 const token = process.env.BOT_TOKEN;
+// Menggunakan Webhook mode murni tanpa polling
 const bot = new TelegramBot(token);
 
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
@@ -147,7 +148,7 @@ async function handleUpdate(update) {
       const isMember = await checkChannelMembership(userId);
       if (!isMember) {
         const channelUrl = `https://t.me/${CHANNEL_USERNAME.replace('@', '')}`;
-        return bot.sendMessage(chatId, 'Jika ingin menggunakan bot ini harap mengikuti channel ini terlebih dahulu.', {
+        return await bot.sendMessage(chatId, 'Jika ingin menggunakan bot ini harap mengikuti channel ini terlebih dahulu.', {
           reply_markup: {
             inline_keyboard: [
               [{ text: '📢 Join Channel', url: channelUrl }],
@@ -169,16 +170,16 @@ async function handleUpdate(update) {
         });
       }
 
-      return bot.sendMessage(chatId, `🎉 Selamat datang! Silahkan pilih menu di bawah ini:`, getMainMenu(userId));
+      return await bot.sendMessage(chatId, `🎉 Selamat datang! Silahkan pilih menu di bawah ini:`, getMainMenu(userId));
     }
 
     if (userState[userId] && userState[userId].step === 'AWAIT_REK_NUMBER') {
       if (!text.startsWith('08')) {
-        return bot.sendMessage(chatId, '❌ Nomor rekening harus berawalan "08". Silahkan coba lagi:');
+        return await bot.sendMessage(chatId, '❌ Nomor rekening harus berawalan "08". Silahkan coba lagi:');
       }
       userState[userId].account_number = text;
       userState[userId].step = 'CONFIRM_WD';
-      return bot.sendMessage(chatId, `📌 **Konfirmasi Penarikan**\n\nMetode: ${userState[userId].method}\nNo Rekening: ${text}`, {
+      return await bot.sendMessage(chatId, `📌 **Konfirmasi Penarikan**\n\nMetode: ${userState[userId].method}\nNo Rekening: ${text}`, {
         reply_markup: {
           inline_keyboard: [
             [{ text: '✅ Konfirmasi Penarikan', callback_data: 'wd_confirm' }],
@@ -206,7 +207,7 @@ async function handleUpdate(update) {
           status: 'Pending'
         });
       }
-      return bot.sendMessage(chatId, `✅ **${matchedLines.length} Bukti Tugas Terkirim!** Status: *Pending*`, { parse_mode: 'Markdown', ...getBackButton() });
+      return await bot.sendMessage(chatId, `✅ **${matchedLines.length} Bukti Tugas Terkirim!** Status: *Pending*`, { parse_mode: 'Markdown', ...getBackButton() });
     }
   }
 
@@ -221,24 +222,24 @@ async function handleUpdate(update) {
 
     if (data === 'menu_main') {
       delete userState[userId];
-      return bot.sendMessage(chatId, '📋 Menu Utama:', getMainMenu(userId));
+      return await bot.sendMessage(chatId, '📋 Menu Utama:', getMainMenu(userId));
     }
 
     if (data === 'menu_profil') {
       const text = `👤 **Profil Pengguna**\n\n🆔 ID: \`${userId}\`\n👤 Nama: ${query.from.first_name}\n🏷 Username: @${query.from.username || '-'}`;
-      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
+      return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
     }
 
     if (data === 'menu_task') {
       const settings = await getSettings();
       const text = `📌 **${settings.task_title}**\n\n${settings.task_desc}\n\n💵 Reward: Rp ${settings.reward_per_task}\n🔑 Inisial Bukti: \`${settings.proof_keyword}\`\n\n👇 *Kirimkan pesan bukti tugas langsung di chat ini.*`;
-      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
+      return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...getBackButton() });
     }
 
     if (data === 'menu_saldo') {
       const balance = await calculateUserBalance(userId);
       const settings = await getSettings();
-      return bot.sendMessage(chatId, `💰 **Informasi Saldo**\n\nSaldo Aktif: Rp ${balance.toLocaleString('id-ID')}\nMinimum Penarikan: Rp ${settings.min_wd.toLocaleString('id-ID')}`, {
+      return await bot.sendMessage(chatId, `💰 **Informasi Saldo**\n\nSaldo Aktif: Rp ${balance.toLocaleString('id-ID')}\nMinimum Penarikan: Rp ${settings.min_wd.toLocaleString('id-ID')}`, {
         reply_markup: {
           inline_keyboard: [
             [{ text: '🏧 Tarik Saldo', callback_data: 'wd_start' }],
@@ -252,9 +253,9 @@ async function handleUpdate(update) {
       const balance = await calculateUserBalance(userId);
       const settings = await getSettings();
       if (balance < settings.min_wd) {
-        return bot.sendMessage(chatId, '❌ Saldo tidak mencukupi.', getBackButton());
+        return await bot.sendMessage(chatId, '❌ Saldo tidak mencukupi.', getBackButton());
       }
-      return bot.sendMessage(chatId, '💳 Pilih e-wallet:', {
+      return await bot.sendMessage(chatId, '💳 Pilih e-wallet:', {
         reply_markup: {
           inline_keyboard: [
             [{ text: 'DANA', callback_data: 'wd_method_DANA' }, { text: 'OVO', callback_data: 'wd_method_OVO' }],
@@ -268,12 +269,12 @@ async function handleUpdate(update) {
     if (data.startsWith('wd_method_')) {
       const method = data.split('_')[2];
       userState[userId] = { step: 'AWAIT_REK_NUMBER', method };
-      return bot.sendMessage(chatId, `Kirim nomor rekening ${method} kamu (berawalan 08...):`);
+      return await bot.sendMessage(chatId, `Kirim nomor rekening ${method} kamu (berawalan 08...):`);
     }
 
     if (data === 'wd_confirm') {
       const state = userState[userId];
-      if (!state || !state.account_number) return bot.sendMessage(chatId, 'Sesi kadaluarsa.', getBackButton());
+      if (!state || !state.account_number) return await bot.sendMessage(chatId, 'Sesi kadaluarsa.', getBackButton());
       const balance = await calculateUserBalance(userId);
       const { wdSheet } = await getSheets();
       await wdSheet.addRow({
@@ -286,22 +287,22 @@ async function handleUpdate(update) {
         status: 'Pending'
       });
       delete userState[userId];
-      return bot.sendMessage(chatId, '⏳ Penarikan sedang diproses oleh admin.', getBackButton());
+      return await bot.sendMessage(chatId, '⏳ Penarikan sedang diproses oleh admin.', getBackButton());
     }
   }
 }
 
-app.post('*', async (req, res) => {
-  try {
-    await handleUpdate(req.body);
-  } catch (err) {
-    console.error("Vercel Webhook Error:", err);
+// Handler khusus Vercel Serverless (Menunggu async function sampai selesai)
+app.use(async (req, res) => {
+  if (req.method === 'POST') {
+    try {
+      await handleUpdate(req.body);
+    } catch (err) {
+      console.error("Vercel Webhook Error:", err);
+    }
+    return res.status(200).json({ ok: true });
   }
-  res.status(200).send('OK');
-});
-
-app.get('*', (req, res) => {
-  res.send('Serverless Vercel Active!');
+  res.status(200).send('Serverless Vercel Active!');
 });
 
 module.exports = app;
