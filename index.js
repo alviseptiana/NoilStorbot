@@ -2,14 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
-const { JWT } = require('google-auth-library');
 const fs = require('fs');
 
 const app = express();
 app.use(express.json());
 
 const token = process.env.BOT_TOKEN;
-// Menggunakan mode Webhook murni (tanpa polling)
 const bot = new TelegramBot(token);
 
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
@@ -36,16 +34,18 @@ try {
   console.error("Credentials error:", e.message);
 }
 
-const serviceAccountAuth = new JWT({
-  email: clientEmail,
-  key: privateKey,
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
+const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
 
-const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID, serviceAccountAuth);
+async function initDoc() {
+  await doc.useServiceAccountAuth({
+    client_email: clientEmail,
+    private_key: privateKey,
+  });
+  await doc.loadInfo();
+}
 
 async function getSheets() {
-  await doc.loadInfo();
+  await initDoc();
   return {
     usersSheet: doc.sheetsByTitle['Users'],
     taskSheet: doc.sheetsByTitle['Task_History'],
@@ -68,12 +68,12 @@ async function getSettings() {
     };
   }
   return {
-    reward_per_task: parseInt(rows[0].get('reward_per_task')) || 0,
-    min_wd: parseInt(rows[0].get('min_wd')) || 0,
-    task_title: rows[0].get('task_title') || '',
-    task_desc: rows[0].get('task_desc') || '',
-    info_text: rows[0].get('info_text') || '',
-    proof_keyword: rows[0].get('proof_keyword') || '',
+    reward_per_task: parseInt(rows[0].reward_per_task) || 0,
+    min_wd: parseInt(rows[0].min_wd) || 0,
+    task_title: rows[0].task_title || '',
+    task_desc: rows[0].task_desc || '',
+    info_text: rows[0].info_text || '',
+    proof_keyword: rows[0].proof_keyword || '',
   };
 }
 
@@ -90,8 +90,8 @@ async function isUserBanned(userId) {
   try {
     const { usersSheet } = await getSheets();
     const rows = await usersSheet.getRows();
-    const user = rows.find(r => r.get('user_id') == userId.toString());
-    return user ? user.get('status') === 'banned' : false;
+    const user = rows.find(r => r.user_id == userId.toString());
+    return user ? user.status === 'banned' : false;
   } catch (err) {
     return false;
   }
@@ -102,13 +102,13 @@ async function calculateUserBalance(userId) {
   const settings = await getSettings();
 
   const taskRows = await taskSheet.getRows();
-  const approvedTasks = taskRows.filter(r => r.get('user_id') == userId.toString() && r.get('status') === 'Approve').length;
+  const approvedTasks = taskRows.filter(r => r.user_id == userId.toString() && r.status === 'Approve').length;
   const totalEarned = approvedTasks * settings.reward_per_task;
 
   const wdRows = await wdSheet.getRows();
   const totalWithdrawn = wdRows
-    .filter(r => r.get('user_id') == userId.toString() && ['Pending', 'Sukses'].includes(r.get('status')))
-    .reduce((sum, r) => sum + (parseInt(r.get('amount')) || 0), 0);
+    .filter(r => r.user_id == userId.toString() && ['Pending', 'Sukses'].includes(r.status))
+    .reduce((sum, r) => sum + (parseInt(r.amount) || 0), 0);
 
   return totalEarned - totalWithdrawn;
 }
@@ -159,7 +159,7 @@ async function handleUpdate(update) {
 
       const { usersSheet } = await getSheets();
       const rows = await usersSheet.getRows();
-      let user = rows.find(r => r.get('user_id') == userId.toString());
+      let user = rows.find(r => r.user_id == userId.toString());
       if (!user) {
         await usersSheet.addRow({
           user_id: userId.toString(),
@@ -291,7 +291,6 @@ async function handleUpdate(update) {
   }
 }
 
-// Endpoint Vercel Serverless Hook
 app.post('*', async (req, res) => {
   try {
     await handleUpdate(req.body);
