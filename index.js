@@ -13,32 +13,51 @@ const bot = new TelegramBot(token);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME ? (process.env.CHANNEL_USERNAME.startsWith('@') ? process.env.CHANNEL_USERNAME : `@${process.env.CHANNEL_USERNAME}`) : '';
 
-let clientEmail = process.env.GOOGLE_CLIENT_EMAIL || '';
-let privateKey = process.env.GOOGLE_PRIVATE_KEY || '';
+function getCredentials() {
+  let clientEmail = process.env.GOOGLE_CLIENT_EMAIL || '';
+  let privateKey = process.env.GOOGLE_PRIVATE_KEY || '';
 
-if (!clientEmail || !privateKey) {
-  try {
+  if (!clientEmail || !privateKey) {
     if (process.env.GOOGLE_CREDENTIALS) {
-      let creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : process.env.GOOGLE_CREDENTIALS;
-      clientEmail = creds.client_email;
-      privateKey = creds.private_key;
+      try {
+        let credsStr = process.env.GOOGLE_CREDENTIALS.trim();
+        let creds = typeof credsStr === 'string' ? JSON.parse(credsStr) : credsStr;
+        clientEmail = creds.client_email || clientEmail;
+        privateKey = creds.private_key || privateKey;
+      } catch (e) {
+        console.error("Failed to parse GOOGLE_CREDENTIALS JSON:", e.message);
+      }
     } else if (fs.existsSync('./credentials.json')) {
-      let creds = JSON.parse(fs.readFileSync('./credentials.json'));
-      clientEmail = creds.client_email;
-      privateKey = creds.private_key;
+      try {
+        let creds = JSON.parse(fs.readFileSync('./credentials.json'));
+        clientEmail = creds.client_email || clientEmail;
+        privateKey = creds.private_key || privateKey;
+      } catch (e) {
+        console.error("Failed to read credentials.json:", e.message);
+      }
     }
-  } catch (e) {
-    console.error("Credentials error:", e.message);
   }
-}
 
-if (privateKey) {
-  privateKey = privateKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
+  if (privateKey) {
+    privateKey = privateKey.trim();
+    if (privateKey.startsWith('"') && privateKey.endsWith('"')) {
+      privateKey = privateKey.slice(1, -1);
+    }
+    privateKey = privateKey.replace(/\\n/g, '\n');
+  }
+
+  return { clientEmail, privateKey };
 }
 
 const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
 
 async function initDoc() {
+  const { clientEmail, privateKey } = getCredentials();
+  
+  if (!clientEmail || !privateKey) {
+    throw new Error(`Credentials Missing! Email: ${clientEmail ? 'OK' : 'MISSING'}, Key: ${privateKey ? 'OK' : 'MISSING'}`);
+  }
+
   await doc.useServiceAccountAuth({
     client_email: clientEmail,
     private_key: privateKey,
@@ -298,7 +317,7 @@ app.use(async (req, res) => {
     try {
       await handleUpdate(req.body);
     } catch (err) {
-      console.error("Vercel Webhook Error:", err);
+      console.error("Vercel Webhook Error:", err.message || err);
     }
     return res.status(200).json({ ok: true });
   }
