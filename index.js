@@ -8,31 +8,32 @@ const app = express();
 app.use(express.json());
 
 const token = process.env.BOT_TOKEN;
-// Menggunakan Webhook mode murni tanpa polling
 const bot = new TelegramBot(token);
 
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME ? (process.env.CHANNEL_USERNAME.startsWith('@') ? process.env.CHANNEL_USERNAME : `@${process.env.CHANNEL_USERNAME}`) : '';
 
-let clientEmail = '';
-let privateKey = '';
+let clientEmail = process.env.GOOGLE_CLIENT_EMAIL || '';
+let privateKey = process.env.GOOGLE_PRIVATE_KEY || '';
 
-try {
-  let creds;
-  if (process.env.GOOGLE_CREDENTIALS) {
-    creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' 
-      ? JSON.parse(process.env.GOOGLE_CREDENTIALS) 
-      : process.env.GOOGLE_CREDENTIALS;
-  } else if (fs.existsSync('./credentials.json')) {
-    creds = JSON.parse(fs.readFileSync('./credentials.json'));
+if (!clientEmail || !privateKey) {
+  try {
+    if (process.env.GOOGLE_CREDENTIALS) {
+      let creds = typeof process.env.GOOGLE_CREDENTIALS === 'string' ? JSON.parse(process.env.GOOGLE_CREDENTIALS) : process.env.GOOGLE_CREDENTIALS;
+      clientEmail = creds.client_email;
+      privateKey = creds.private_key;
+    } else if (fs.existsSync('./credentials.json')) {
+      let creds = JSON.parse(fs.readFileSync('./credentials.json'));
+      clientEmail = creds.client_email;
+      privateKey = creds.private_key;
+    }
+  } catch (e) {
+    console.error("Credentials error:", e.message);
   }
-  
-  if (creds) {
-    clientEmail = creds.client_email;
-    privateKey = creds.private_key ? creds.private_key.replace(/\\n/g, '\n') : '';
-  }
-} catch (e) {
-  console.error("Credentials error:", e.message);
+}
+
+if (privateKey) {
+  privateKey = privateKey.replace(/^"|"$/g, '').replace(/\\n/g, '\n');
 }
 
 const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
@@ -292,7 +293,6 @@ async function handleUpdate(update) {
   }
 }
 
-// Handler khusus Vercel Serverless (Menunggu async function sampai selesai)
 app.use(async (req, res) => {
   if (req.method === 'POST') {
     try {
